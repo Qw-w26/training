@@ -316,4 +316,6 @@ second,mean_pitch_deg
 
 ## 仿真录像（Simulation Recording）
 
-15 秒 MuJoCo 图形界面录屏保存在工作目录：[`evidence/wheel_leg_balance.mp4`](evidence/wheel_leg_balance.mp4)。视频未上传。托管网址：**（留空）**。推荐 Bilibili 或 YouTube（设为不公开）用于在线播放；如需分享文件链接，可用 Google Drive 或 OneDrive。
+一段时长为 **15 秒的 MuJoCo GUI 仿真录像**已经分享在：
+
+[15 秒 MuJoCo GUI 仿真录像](https://kdocs.cn/view/media/l/csgsNyp0Sdac)
