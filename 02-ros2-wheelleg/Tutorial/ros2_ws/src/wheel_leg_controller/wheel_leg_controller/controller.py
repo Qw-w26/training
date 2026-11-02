@@ -1,10 +1,11 @@
 import math
+import time
 
 import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from rm_msgs.msg import WheelLegCmd
-from sensor_msgs.msg import Imu, JointState
+from sensor_msgs.msg import Imu, JointState, Joy
 
 from .lqr_update import lqr_controller
 from .vmc_cal import five_links_param
@@ -56,15 +57,56 @@ class RollLegController(BaseController):
         return left, right
 
 
+class WheelSpeedPIController(BaseController):
+    def __init__(self, kp=0.25, ki=0.20, max_output=0.45):
+        self.kp = kp
+        self.ki = ki
+        self.max_output = max_output
+        self.integral = 0.0
+
+    def compute(self, target_speed, measured_speed, dt):
+        error = target_speed - measured_speed
+        candidate_integral = self.integral + error * dt
+        raw_output = self.kp * error + self.ki * candidate_integral
+        output = max(-self.max_output, min(self.max_output, raw_output))
+        if (raw_output == output
+                or (raw_output > self.max_output and error < 0.0)
+                or (raw_output < -self.max_output and error > 0.0)):
+            self.integral = candidate_integral
+        return output
+
+
 class WheelLegController(BaseController, Node):
     def __init__(self):
         Node.__init__(self, 'wheel_leg_controller')
         self.declare_parameter('dt', 0.002)
         self.declare_parameter('wheel_radius', 0.06)
         self.declare_parameter('target_length', 0.10)
+        self.declare_parameter('joy_timeout', 0.5)
+        self.declare_parameter('cmd_vel_timeout', 0.5)
+        self.declare_parameter('max_linear_speed', 0.6)
+        self.declare_parameter('max_yaw_rate', 2.0)
+        self.declare_parameter('joy_linear_axis', 1)
+        self.declare_parameter('joy_yaw_axis', 3)
+        self.declare_parameter('joy_linear_sign', -1.0)
+        self.declare_parameter('joy_yaw_sign', -1.0)
+        self.declare_parameter('wheel_pi_only', False)
+        self.declare_parameter('wheel_speed_kp', 0.25)
+        self.declare_parameter('wheel_speed_ki', 0.20)
+        self.declare_parameter('wheel_speed_pi_limit', 0.0)
+        self.declare_parameter('lqr_velocity_scale', 0.5)
         self.dt = float(self.get_parameter('dt').value)
         self.wheel_radius = float(self.get_parameter('wheel_radius').value)
         self.target_length = float(self.get_parameter('target_length').value)
+        self.joy_timeout = float(self.get_parameter('joy_timeout').value)
+        self.cmd_vel_timeout = float(self.get_parameter('cmd_vel_timeout').value)
+        self.max_linear_speed = float(self.get_parameter('max_linear_speed').value)
+        self.max_yaw_rate = float(self.get_parameter('max_yaw_rate').value)
+        self.joy_linear_axis = int(self.get_parameter('joy_linear_axis').value)
+        self.joy_yaw_axis = int(self.get_parameter('joy_yaw_axis').value)
+        self.joy_linear_sign = float(self.get_parameter('joy_linear_sign').value)
+        self.joy_yaw_sign = float(self.get_parameter('joy_yaw_sign').value)
+        self.lqr_velocity_scale = float(self.get_parameter('lqr_velocity_scale').value)
 
         self.right_leg = five_links_param(dt=self.dt)
         self.left_leg = five_links_param(dt=self.dt)
@@ -77,6 +119,11 @@ class WheelLegController(BaseController, Node):
         self.roll_balancer = RollLegController(
             kp=1.0, ki=0.0, kd=0.0, max_out=0.14,
             min_leg=0.10, max_leg=0.14)
+        self.wheel_pi_only = bool(self.get_parameter('wheel_pi_only').value)
+        self.wheel_speed_pi = WheelSpeedPIController(
+            kp=float(self.get_parameter('wheel_speed_kp').value),
+            ki=float(self.get_parameter('wheel_speed_ki').value),
+            max_output=float(self.get_parameter('wheel_speed_pi_limit').value))
 
         self.imu = None
         self.joints = None
@@ -84,16 +131,66 @@ class WheelLegController(BaseController, Node):
         self.current_v = 0.0
         self.target_v = 0.0
         self.target_w = 0.0
+        self.cmd_vel_target = (0.0, 0.0)
+        self.joy_target = (0.0, 0.0)
+        self.last_cmd_vel_time = None
+        self.last_joy_time = None
+        self.previous_joy_buttons = (0, 0)
         self.cmd_pub = self.create_publisher(WheelLegCmd, 'actuator_cmd', 10)
         self.create_subscription(Imu, 'imu', self.on_imu, 10)
         self.create_subscription(JointState, 'joint_states', self.on_joints, 10)
         self.create_subscription(Twist, 'cmd_vel', self.on_cmd_vel, 10)
+        self.create_subscription(Joy, 'joy', self.on_joy, 10)
         self.get_logger().info('LQR/VMC controller ready; waiting for /imu and /joint_states')
 
-    # 三个 Callback 函数，分别处理 cmd_vel、imu 和 joint_states 消息
+    # Callback 函数们
     def on_cmd_vel(self, msg):
-        self.target_v = float(msg.linear.x)
-        self.target_w = float(msg.angular.z)
+        self.cmd_vel_target = (float(msg.linear.x), float(msg.angular.z))
+        self.last_cmd_vel_time = time.monotonic()
+
+    def on_joy(self, msg):
+        """处理手柄输入"""
+        now = time.monotonic()
+        self.last_joy_time = now
+        axes = msg.axes
+        # 获取前后转向轴
+        linear_axis = (axes[self.joy_linear_axis]
+                       if len(axes) > self.joy_linear_axis else 0.0)
+        # 获取左右转向轴
+        yaw_axis = (axes[self.joy_yaw_axis]
+                    if len(axes) > self.joy_yaw_axis else 0.0)
+        # 防误触的死区处理
+        if abs(linear_axis) < 0.1:
+            linear_axis = 0.0
+        if abs(yaw_axis) < 0.1:
+            yaw_axis = 0.0
+        # 摇杆输入转换为机器人速度目标
+        self.joy_target = (
+            self.joy_linear_sign * linear_axis * self.max_linear_speed,
+            self.joy_yaw_sign * yaw_axis * self.max_yaw_rate,
+        )
+
+        buttons = msg.buttons
+        # buttons[4]：LB，左肩键
+        # buttons[5]：RB，右肩键
+        lb = int(buttons[4]) if len(buttons) > 4 else 0
+        rb = int(buttons[5]) if len(buttons) > 5 else 0
+        old_lb, old_rb = self.previous_joy_buttons
+        if rb and not old_rb:
+            self.target_length = min(0.14, self.target_length + 0.005)
+        if lb and not old_lb:
+            self.target_length = max(0.10, self.target_length - 0.005)
+        self.previous_joy_buttons = (lb, rb)
+
+    def active_targets(self):
+        """选择输入源"""
+        now = time.monotonic()
+        if self.last_joy_time is not None and now - self.last_joy_time <= self.joy_timeout:
+            return self.joy_target
+        if (self.last_cmd_vel_time is not None
+                and now - self.last_cmd_vel_time <= self.cmd_vel_timeout):
+            return self.cmd_vel_target
+        return 0.0, 0.0
 
     def on_imu(self, msg):
         self.imu = msg
@@ -158,12 +255,26 @@ class WheelLegController(BaseController, Node):
 
         common_speed = (vel['leftwheel'] - vel['rightwheel']) / 2.0
         common_pos = (pos['leftwheel'] - pos['rightwheel']) / 2.0
+        self.target_v, self.target_w = self.active_targets()
         self.current_v = self.ramp_velocity(self.current_v, self.target_v, dt)
         if not (self.current_v == 0.0 and self.target_v == 0.0):
             self.right_lqr.x_b_set = common_pos * self.wheel_radius
             self.left_lqr.x_b_set = common_pos * self.wheel_radius
-        self.right_lqr.v_set = self.current_v
-        self.left_lqr.v_set = self.current_v
+        # The source LQR uses the opposite wheel sign from ROS linear.x.
+        lqr_v_set = -self.current_v
+        if self.wheel_pi_only:
+            pi_torque = self.wheel_speed_pi.compute(
+                -self.current_v, common_speed * self.wheel_radius, dt)
+            cmd = WheelLegCmd()
+            cmd.right_wheel = -pi_torque
+            cmd.left_wheel = pi_torque
+            self.cmd_pub.publish(cmd)
+            return
+
+        lqr_v_set *= self.lqr_velocity_scale
+        self.right_lqr.v_set = lqr_v_set
+        self.left_lqr.v_set = lqr_v_set
+
         target_left, target_right = self.roll_balancer.compute_leg_lengths(
             current_roll=roll, target_roll=0.0, base_length=self.target_length)
 
@@ -175,6 +286,11 @@ class WheelLegController(BaseController, Node):
             1, self.left_leg, self.left_lqr, self.left_length_pid,
             self.left_yaw_pid, pos['left1'], pos['left2'], pitch,
             gyro_pitch, gyro_yaw, common_pos, common_speed, target_left)
+
+        pi_torque = self.wheel_speed_pi.compute(
+            lqr_v_set, common_speed * self.wheel_radius, dt)
+        right = (right[0], right[1], max(-2.0, min(2.0, right[2] - pi_torque)))
+        left = (left[0], left[1], max(-2.0, min(2.0, left[2] + pi_torque)))
 
         # 发布最终电机指令
         cmd = WheelLegCmd()
